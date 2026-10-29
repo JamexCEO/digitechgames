@@ -1,0 +1,277 @@
+import math
+import random
+
+import pygame
+import pymunk
+
+# ---------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------
+WIDTH = 800
+HEIGHT = 800
+GROUND_TOP = 740          # y of the top surface of the floor
+BUN_W, BUN_H = 160, 40
+BUN_TOP = GROUND_TOP - BUN_H
+DROP_GAP = 200            # how far above the tower the moving ingredient hovers
+CAMERA_TARGET = 400       # screen y where we try to keep the top of the tower
+
+# (name, colour, width, height, value)
+START_INGREDIENTS = [
+    ("Tomato", (220, 50, 50), 80, 20, 5),
+    ("Cheese", (255, 220, 50), 90, 10, 4),
+    ("Lettuce", (50, 180, 70), 100, 15, 3),
+    ("Patty", (100, 55, 30), 85, 30, 10),
+]
+
+# (name, colour, width, height, value, cost)
+SHOP_ITEMS = [
+    ("Bacon", (190, 70, 80), 95, 12, 15, 40),
+    ("Fried Egg", (250, 250, 240), 70, 14, 25, 100),
+    ("Golden Patty", (230, 190, 40), 85, 30, 50, 250),
+]
+
+
+# ---------------------------------------------------------------
+# INGREDIENT CLASS (original, with value + camera support)
+# ---------------------------------------------------------------
+class Ingredient:
+    def __init__(self, name, colour, width, height, value, x, y):
+        self.name = name
+        self.colour = colour
+        self.width = width
+        self.height = height
+        self.value = value
+        self.x = x
+        self.y = y
+        self.direction = 1
+        self.dropped = False
+
+    def move(self, speed):
+        self.x += speed * self.direction
+
+    def bounce(self):
+        if self.x + self.width >= WIDTH:
+            self.direction = -1
+        elif self.x <= 0:
+            self.direction = 1
+
+    def drop(self, space):
+        # Mass proportional to area, so big pieces are heavier than small ones.
+        mass = self.width * self.height / 1000
+        body = pymunk.Body(mass, pymunk.moment_for_box(mass, (self.width, self.height)))
+        body.position = (self.x + self.width / 2, self.y + self.height / 2)
+        shape = pymunk.Poly.create_box(body, (self.width, self.height))
+        shape.friction = 0.8
+        space.add(body, shape)
+        self.body = body
+        self.shape = shape
+        self.dropped = True
+
+    def on_floor(self):
+        # shape.cache_bb() gives the bounding box; .top is the LOWEST y edge
+        # (pygame's y axis points down).
+        return self.dropped and self.shape.cache_bb().top >= GROUND_TOP - 2
+
+    def draw(self, screen, cam):
+        if self.dropped:
+            image = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            image.fill(self.colour)
+            rotated = pygame.transform.rotate(image, -math.degrees(self.body.angle))
+            rect = rotated.get_rect(
+                center=(round(self.body.position.x), round(self.body.position.y + cam))
+            )
+            screen.blit(rotated, rect)
+        else:
+            pygame.draw.rect(
+                screen, self.colour, (self.x, self.y + cam, self.width, self.height)
+            )
+
+
+# ---------------------------------------------------------------
+# GAME CLASS
+# ---------------------------------------------------------------
+class Game:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        pygame.display.set_caption("Burger Stack")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(None, 32)
+        self.big_font = pygame.font.SysFont(None, 64)
+
+        self.coins = 0
+        self.unlocked = list(START_INGREDIENTS)
+        self.bought = set()
+        self.stacked = []
+        self.build_world()
+        self.new_round()
+
+    # ----- setup -----
+    def build_world(self):
+        self.space = pymunk.Space()
+        self.space.gravity = (0, 900)
+        self.space.iterations = 30
+        self.space.collision_slop = 0.01
+        # collision_bias = fraction of overlap LEFT after one second.
+        # The default (0.9 ** 60) fixes overlap slowly -- that is the gradual
+        # "rising out" I saw. A smaller number pushes ingredients out faster.
+        self.space.collision_bias = pow(1.0 - 0.3, 60.0)
+
+        ground = pymunk.Segment(self.space.static_body, (-3000, 750), (3800, 750), 10)
+        ground.friction = 0.8
+
+        self.bun_body = pymunk.Body(body_type=pymunk.Body.STATIC)
+        self.bun_body.position = (WIDTH / 2, BUN_TOP + BUN_H / 2)
+        bun_shape = pymunk.Poly.create_box(self.bun_body, (BUN_W, BUN_H))
+        bun_shape.friction = 0.8
+        self.space.add(ground, self.bun_body, bun_shape)
+
+    def new_round(self):
+        for ing in self.stacked:
+            self.space.remove(ing.body, ing.shape)
+        self.stacked = []
+        self.drops = 0
+        self.cam = 0.0
+        self.timer = 0
+        self.state = "play"
+        self.active = self.make_ingredient()
+
+    def make_ingredient(self):
+        name, colour, w, h, value = random.choice(self.unlocked)
+        return Ingredient(name, colour, w, h, value, 100, self.tower_top() - DROP_GAP - h)
+
+    # ----- helpers -----
+    def tower_top(self):
+        """Highest y-position (smallest number) of the settled tower."""
+        top = BUN_TOP
+        for ing in self.stacked:
+            if not ing.on_floor() and ing.body.velocity.length < 40:
+                top = min(top, ing.shape.cache_bb().bottom)
+        return top
+
+    def finish_round(self):
+        kept = [
+            i for i in self.stacked
+            if not i.on_floor() and abs(i.body.position.x - WIDTH / 2) < BUN_W
+        ]
+        self.last_count = len(kept)
+        self.last_value = sum(i.value for i in kept)
+        self.coins += self.last_value
+        self.state = "over"
+
+    # ----- per-frame logic -----
+    def handle_event(self, event):
+        if event.type != pygame.KEYDOWN:
+            return
+        if self.state == "play" and event.key == pygame.K_SPACE:
+            self.active.drop(self.space)
+            self.stacked.append(self.active)
+            self.drops += 1
+            self.active = self.make_ingredient()
+        elif self.state == "over":
+            if event.key == pygame.K_RETURN:
+                self.new_round()
+            elif event.key == pygame.K_s:
+                self.state = "shop"
+        elif self.state == "shop":
+            if event.key in (pygame.K_RETURN, pygame.K_ESCAPE):
+                self.new_round()
+            elif pygame.K_1 <= event.key < pygame.K_1 + len(SHOP_ITEMS):
+                self.try_buy(SHOP_ITEMS[event.key - pygame.K_1])
+
+    def try_buy(self, item):
+        name, colour, w, h, value, cost = item
+        if name not in self.bought and self.coins >= cost:
+            self.coins -= cost
+            self.bought.add(name)
+            self.unlocked.append((name, colour, w, h, value))
+
+    def update(self):
+        if self.state in ("play", "falling"):
+            self.space.step(1 / 120)
+            self.space.step(1 / 120)
+
+        if self.state == "play":
+            speed = min(12, 5 + 0.15 * self.drops)
+            self.active.move(speed)
+            self.active.bounce()
+            target_y = self.tower_top() - DROP_GAP - self.active.height
+            self.active.y += (target_y - self.active.y) * 0.1
+            if any(i.on_floor() for i in self.stacked):
+                self.state = "falling"
+                self.timer = 90          # 1.5 s to let the tower finish toppling
+                self.active = None
+        elif self.state == "falling":
+            self.timer -= 1
+            if self.timer <= 0:
+                self.finish_round()
+
+        target_cam = max(0, CAMERA_TARGET - self.tower_top())
+        self.cam += (target_cam - self.cam) * 0.05
+
+    # ----- drawing -----
+    def text(self, string, font, y, colour=(40, 30, 20)):
+        surf = font.render(string, True, colour)
+        self.screen.blit(surf, surf.get_rect(center=(WIDTH // 2, y)))
+
+    def draw(self):
+        self.screen.fill((255, 253, 208))
+
+        if self.state == "shop":
+            self.draw_shop()
+            pygame.display.flip()
+            return
+
+        # floor and bottom bun (world y + camera = screen y)
+        pygame.draw.rect(self.screen, (120, 120, 120),
+                         (0, GROUND_TOP + self.cam, WIDTH, 2000))
+        pygame.draw.rect(self.screen, (210, 145, 65),
+                         (WIDTH / 2 - BUN_W / 2, BUN_TOP + self.cam, BUN_W, BUN_H))
+
+        for ing in self.stacked:
+            ing.draw(self.screen, self.cam)
+        if self.active:
+            self.active.draw(self.screen, self.cam)
+
+        hud = self.font.render(f"Dropped: {self.drops}   Coins: {self.coins}", True, (40, 30, 20))
+        self.screen.blit(hud, (10, 10))
+
+        if self.state == "over":
+            self.text("GAME OVER", self.big_font, 300)
+            self.text(f"Burger: {self.last_count} ingredients = ${self.last_value}", self.font, 360)
+            self.text("ENTER = play again     S = shop", self.font, 400)
+
+        pygame.display.flip()
+
+    def draw_shop(self):
+        self.text("SHOP", self.big_font, 100)
+        self.text(f"Coins: {self.coins}", self.font, 160)
+        y = 250
+        for number, item in enumerate(SHOP_ITEMS, start=1):
+            name, colour, w, h, value, cost = item
+            if name in self.bought:
+                label = f"{name} - OWNED (worth ${value})"
+            else:
+                label = f"[{number}] {name} - ${cost} (worth ${value} each)"
+            pygame.draw.rect(self.screen, colour, (150, y - h // 2, w // 2, h))
+            self.text(label, self.font, y)
+            y += 80
+        self.text("ENTER = back to the game", self.font, 600)
+
+    # ----- main loop -----
+    def run(self):
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                else:
+                    self.handle_event(event)
+            self.update()
+            self.draw()
+            self.clock.tick(60)
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    Game().run()
