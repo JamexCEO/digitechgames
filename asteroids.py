@@ -144,8 +144,7 @@ while True:
     was_SPACE = is_SPACE    
     bullets_P = [[a, b, c, d, e, f] for a, b, c, d, e, f in bullets_P if f < 270]
     bullets_P = [[bod_x(a + math.cos(e + math.pi) + c), bod_y(b + math.sin(e + math.pi) + d), c, d, e, f + 1] for a, b, c, d, e, f in bullets_P]
-    asteroids_O = [
-        [bod_x(a + math.cos(c) * e), bod_y(b + math.sin(c) * e), c, d, e] for a, b, c, d, e in asteroids_O]
+    asteroids_O = [[bod_x(a + math.cos(c) * e * 0.75), bod_y(b + math.sin(c) * e * 0.75), c, d, e] for a, b, c, d, e in asteroids_O]
     if len(asteroids_O) == 0:
         asteroids_number_O += 1
         for _ in range(asteroids_number_O):
